@@ -6,8 +6,8 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
-      send_test_email:
-        description: "发送测试邮件（首次配置完 Secrets 后勾选此项测试收信）"
+      send_test_notification:
+        description: "发送测试通知（配置完 Telegram 或邮箱 Secrets 后勾选测试）"
         required: false
         default: false
         type: boolean
@@ -36,13 +36,15 @@ jobs:
         env:
           KEYWORDS: ${{ inputs.keywords || vars.KEYWORDS || '破云' }}
           EXCLUDE_KEYWORDS: ${{ vars.EXCLUDE_KEYWORDS || '' }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
           SMTP_HOST: ${{ secrets.SMTP_HOST || 'smtp.gmail.com' }}
           SMTP_PORT: ${{ secrets.SMTP_PORT || '465' }}
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
-          SEND_TEST_EMAIL: ${{ inputs.send_test_email && 'true' || 'false' }}
+          SEND_TEST_NOTIFICATION: ${{ inputs.send_test_notification && 'true' || 'false' }}
           STATE_FILE: seen_ids.json
         run: python3 monitor.py
 

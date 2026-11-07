@@ -276,6 +276,61 @@ def build_email_message(
     return msg
 
 
+def build_telegram_text(matched_posts: list[dict[str, Any]], is_test: bool = False) -> str:
+    header = (
+        "<b>✅ [测试成功] NodeSeek「破云」监控通知已打通</b>"
+        if is_test
+        else f"<b>🔔 NodeSeek 发现 {len(matched_posts)} 条匹配新帖</b>"
+    )
+    blocks: list[str] = [header]
+    for post in matched_posts:
+        title = html.escape(post.get("title", "(无标题)"))
+        link = html.escape(post.get("link", "https://www.nodeseek.com"))
+        category = html.escape(post.get("category", ""))
+        pub_date = html.escape(post.get("pub_date", ""))
+        matched_kws = html.escape(", ".join(post.get("matched_keywords", [])))
+        summary = html.escape(post.get("summary", "")[:160])
+
+        lines = [f'• <a href="{link}"><b>{title}</b></a>']
+        meta = [
+            x
+            for x in (
+                f"板块: {category}" if category else "",
+                f"命中: {matched_kws}" if matched_kws else "",
+                pub_date,
+            )
+            if x
+        ]
+        if meta:
+            lines.append(f"  <i>{' | '.join(meta)}</i>")
+        if summary:
+            lines.append(f"  {summary}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def send_telegram_message(bot_token: str, chat_id: str, text: str, timeout: int = 20) -> None:
+    api_url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+    payload = json.dumps(
+        {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        api_url,
+        data=payload,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = json.loads(resp.read().decode("utf-8", errors="replace"))
+        if not body.get("ok"):
+            raise RuntimeError(f"Telegram API 返回错误: {body}")
+
+
 def send_smtp_email(
     msg: MIMEMultipart,
     smtp_host: str,
@@ -299,10 +354,60 @@ def send_smtp_email(
             server.sendmail(from_email, [to_email], msg.as_string())
 
 
+def dispatch_notifications(
+    posts: list[dict[str, Any]],
+    *,
+    is_test: bool,
+    tg_bot_token: str,
+    tg_chat_id: str,
+    smtp_host: str,
+    smtp_port: int,
+    smtp_user: str,
+    smtp_pass: str,
+    from_email: str,
+    to_email: str,
+) -> bool:
+    has_telegram = bool(tg_bot_token and tg_chat_id)
+    has_email = bool(smtp_host and smtp_user and smtp_pass and to_email)
+
+    if not has_telegram and not has_email:
+        print(
+            "[ERROR] 未配置任何推送通道！请在 Secrets 中配置 Telegram（TG_BOT_TOKEN + TG_CHAT_ID）或邮箱（SMTP_USER + SMTP_PASS）。",
+            file=sys.stderr,
+        )
+        return False
+
+    any_sent = False
+
+    if has_telegram:
+        try:
+            tg_text = build_telegram_text(posts, is_test=is_test)
+            send_telegram_message(tg_bot_token, tg_chat_id, tg_text)
+            print("[INFO] Telegram 消息推送成功。")
+            any_sent = True
+        except Exception as exc:
+            print(f"[ERROR] Telegram 推送失败: {exc}", file=sys.stderr)
+
+    if has_email:
+        try:
+            msg = build_email_message(posts, from_email=from_email, to_email=to_email, is_test=is_test)
+            send_smtp_email(msg, smtp_host, smtp_port, smtp_user, smtp_pass, from_email, to_email)
+            print(f"[INFO] 邮件已成功推送至 {to_email}")
+            any_sent = True
+        except Exception as exc:
+            print(f"[ERROR] 邮件推送失败: {exc}", file=sys.stderr)
+
+    return any_sent
+
+
 def main() -> int:
     rss_url = os.getenv("RSS_URL", DEFAULT_RSS_URL).strip() or DEFAULT_RSS_URL
     keywords = parse_keywords(os.getenv("KEYWORDS", DEFAULT_KEYWORDS))
     exclude_keywords = parse_keywords(os.getenv("EXCLUDE_KEYWORDS", ""))
+
+    tg_bot_token = os.getenv("TG_BOT_TOKEN", "").strip()
+    tg_chat_id = os.getenv("TG_CHAT_ID", "").strip()
+
     smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com").strip()
     smtp_port = int(os.getenv("SMTP_PORT", "465").strip() or "465")
     smtp_user = os.getenv("SMTP_USER", "").strip()
@@ -314,38 +419,50 @@ def main() -> int:
     state_path = Path(os.getenv("STATE_FILE", DEFAULT_STATE_FILE))
 
     dry_run = env_bool("DRY_RUN", False)
-    send_test = env_bool("SEND_TEST_EMAIL", False)
+    send_test = env_bool("SEND_TEST_NOTIFICATION", False) or env_bool("SEND_TEST_EMAIL", False)
 
     if not keywords:
         print("[ERROR] KEYWORDS 不能为空。", file=sys.stderr)
         return 1
 
+    active_channels: list[str] = []
+    if tg_bot_token and tg_chat_id:
+        active_channels.append("Telegram")
+    if smtp_host and smtp_user and smtp_pass and to_email:
+        active_channels.append("Email")
+
     print(f"[INFO] 监控源: {rss_url}")
     print(f"[INFO] 监控标题关键词: {keywords} | 排除词: {exclude_keywords or '无'}")
-    print(f"[INFO] 目标收件邮箱: {to_email or '(未配置，发信时需提供 TO_EMAIL 或 SMTP_USER)'}")
+    print(f"[INFO] 已启用推送通道: {', '.join(active_channels) if active_channels else '尚未配置凭证'}")
 
     if send_test:
         test_post = [
             {
                 "id": "test-0",
-                "title": "【测试邮件】NodeSeek「破云」关键词监控工作正常",
+                "title": "【测试通知】NodeSeek「破云」关键词监控工作正常",
                 "link": "https://www.nodeseek.com",
                 "pub_date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
                 "category": "测试",
                 "matched_keywords": keywords,
-                "summary": "这是一封由手动触发生成的测试邮件，收到此邮件说明 SMTP 发信配置已生效。",
+                "summary": "这是一条由手动触发生成的测试消息，收到说明推送配置已生效。",
             }
         ]
         if dry_run:
-            print("[DRY_RUN] 测试邮件预览生成成功，跳过实际 SMTP 发送。")
+            print("[DRY_RUN] 测试通知预览生成成功，跳过实际发送。")
             return 0
-        if not (smtp_host and smtp_user and smtp_pass and to_email):
-            print("[ERROR] 发送测试邮件需要配置 SMTP_HOST、SMTP_USER、SMTP_PASS（以及可选 TO_EMAIL）。", file=sys.stderr)
-            return 1
-        msg = build_email_message(test_post, from_email=from_email, to_email=to_email, is_test=True)
-        send_smtp_email(msg, smtp_host, smtp_port, smtp_user, smtp_pass, from_email, to_email)
-        print(f"[INFO] 测试邮件已成功发送至 {to_email}")
-        return 0
+        ok = dispatch_notifications(
+            test_post,
+            is_test=True,
+            tg_bot_token=tg_bot_token,
+            tg_chat_id=tg_chat_id,
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+            smtp_user=smtp_user,
+            smtp_pass=smtp_pass,
+            from_email=from_email,
+            to_email=to_email,
+        )
+        return 0 if ok else 1
 
     try:
         xml_bytes = fetch_rss_xml(rss_url)
@@ -386,19 +503,23 @@ def main() -> int:
         print(f"  - [{post['id']}] {post['title']} ({post['link']})")
 
     if dry_run:
-        print("[DRY_RUN] 已跳过邮件发送与状态写入。")
+        print("[DRY_RUN] 已跳过消息推送与状态写入。")
         return 0
 
-    if not (smtp_host and smtp_user and smtp_pass):
-        print(
-            "[ERROR] 检测到匹配新帖，但未配置 SMTP_USER / SMTP_PASS！请在 GitHub Actions Secrets 或环境变量中配置后重试。",
-            file=sys.stderr,
-        )
+    ok = dispatch_notifications(
+        matched_new_posts,
+        is_test=False,
+        tg_bot_token=tg_bot_token,
+        tg_chat_id=tg_chat_id,
+        smtp_host=smtp_host,
+        smtp_port=smtp_port,
+        smtp_user=smtp_user,
+        smtp_pass=smtp_pass,
+        from_email=from_email,
+        to_email=to_email,
+    )
+    if not ok:
         return 1
-
-    msg = build_email_message(matched_new_posts, from_email=from_email, to_email=to_email)
-    send_smtp_email(msg, smtp_host, smtp_port, smtp_user, smtp_pass, from_email, to_email)
-    print(f"[INFO] 邮件已成功推送至 {to_email}")
 
     for post in matched_new_posts:
         if post["id"] not in seen_set:

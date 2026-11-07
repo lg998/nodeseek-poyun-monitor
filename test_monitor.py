@@ -4,6 +4,7 @@ from pathlib import Path
 
 from monitor import (
     build_email_message,
+    build_telegram_text,
     extract_post_id,
     load_seen_ids,
     match_title_keywords,
@@ -88,6 +89,22 @@ class MonitorUnitTests(unittest.TestCase):
         html_part = msg.get_payload()[1].get_payload(decode=True).decode("utf-8")
         self.assertIn("post-1039001-1", plain_part)
         self.assertIn("破云", html_part)
+
+    def test_build_telegram_text_escapes_html(self) -> None:
+        posts = [
+            {
+                "id": "post-1",
+                "title": "【出】破云 <1C & 2G>",
+                "link": "https://www.nodeseek.com/post-1-1",
+                "category": "trade",
+                "pub_date": "Sat, 07 Nov 2026",
+                "matched_keywords": ["破云"],
+                "summary": "测试摘要 <tag>",
+            }
+        ]
+        tg_html = build_telegram_text(posts)
+        self.assertIn("&lt;1C &amp; 2G&gt;", tg_html)
+        self.assertIn("https://www.nodeseek.com/post-1-1", tg_html)
 
 
 if __name__ == "__main__":
